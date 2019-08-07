@@ -2,7 +2,7 @@
 <feed xmlns="http://www.w3.org/2005/Atom">
     <id>https://languidme.github.io/</id>
     <title>Gridea</title>
-    <updated>2019-08-02T10:34:59.698Z</updated>
+    <updated>2019-08-07T10:28:58.917Z</updated>
     <generator>https://github.com/jpmonette/feed</generator>
     <link rel="alternate" href="https://languidme.github.io/"/>
     <link rel="self" href="https://languidme.github.io//atom.xml"/>
@@ -10,6 +10,459 @@
     <logo>https://languidme.github.io//images/avatar.png</logo>
     <icon>https://languidme.github.io//favicon.ico</icon>
     <rights>All rights reserved 2019, Gridea</rights>
+    <entry>
+        <title type="html"><![CDATA[netty源码分析流程(二)]]></title>
+        <id>https://languidme.github.io//post/netty-yuan-ma-fen-xi-liu-cheng-er</id>
+        <link href="https://languidme.github.io//post/netty-yuan-ma-fen-xi-liu-cheng-er">
+        </link>
+        <updated>2019-08-07T10:26:49.000Z</updated>
+        <content type="html"><![CDATA[<ul>
+<li>本次接着上次分析,此次该分析netty怎么进行事件处理的了,首先找到入口。</li>
+</ul>
+<pre><code class="language-java">// doBind0
+private static void doBind0(
+            final ChannelFuture regFuture, final Channel channel,
+            final SocketAddress localAddress, final ChannelPromise promise) {
+	channel.eventLoop().execute(new Runnable() {
+		@Override
+		public void run() {
+			if (regFuture.isSuccess()) {
+				channel.bind(localAddress, promise).addListener(ChannelFutureListener.CLOSE_ON_FAILURE);
+			} else {
+				promise.setFailure(regFuture.cause());
+			}
+		}
+	});
+}
+</code></pre>
+<ul>
+<li>还记着上面这段代码吧。不记得的可以再去回顾一下上一章。这段代码就是把bind构建成了一个任务task然后交给了<code>bossGroup</code>去执行,下面就看一下execute这个方法</li>
+</ul>
+<pre><code class="language-java">// SingleThreadEventExecutor.java
+public void execute(Runnable task) {
+	boolean inEventLoop = inEventLoop();
+	// 判断是否为同一线程
+	if (inEventLoop) {
+		// 添加任务到队列,如果添加失败会调用拒绝策略
+		addTask(task);
+	} else {
+		// 启动线程  此线程用于处理读写事件 ***重点
+		startThread();
+		addTask(task);
+		if (isShutdown() &amp;&amp; removeTask(task)) {
+			reject();
+		}
+	}
+
+	if (!addTaskWakesUp &amp;&amp; wakesUpForTask(task)) {
+		// 唤醒selector
+		wakeup(inEventLoop);
+	}
+}
+
+private void startThread() {
+	// 判断状态是否为未启动
+	if (STATE_UPDATER.get(this) == ST_NOT_STARTED) {
+		// 设置启动状态为 已启动
+		if (STATE_UPDATER.compareAndSet(this, ST_NOT_STARTED, ST_STARTED)) {
+			// 启动线程
+			doStartThread();
+		}
+	}
+}
+
+// 启动线程方法  进行对事件的处理
+private void doStartThread() {
+	assert thread == null;
+	executor.execute(new Runnable() {
+		@Override
+		public void run() {
+			// 获取当前线程
+			thread = Thread.currentThread();
+			if (interrupted) {
+				// 是否中断
+				thread.interrupt();
+			}
+			
+			boolean success = false;
+			// 更新上次执行时间
+			updateLastExecutionTime();
+			try {
+				// 等于 this.run() 执行for循环 --&gt; 处理事件  执行的就是子类NioEventLoop的run方法 重点*****
+				// NioEventLoop就是在NioEventLoopGroup.newChild进行的构建,可以回顾下前面一篇
+				SingleThreadEventExecutor.this.run();
+				success = true;
+			} catch (Throwable t) {
+				logger.warn(&quot;Unexpected exception from an event executor: &quot;, t);
+			} finally {
+				for (;;) {
+					// 设置状态为ST_SHUTTING_DOWN停止运行
+					int oldState = STATE_UPDATER.get(SingleThreadEventExecutor.this);
+					if (oldState &gt;= ST_SHUTTING_DOWN || STATE_UPDATER.compareAndSet(
+							SingleThreadEventExecutor.this, oldState, ST_SHUTTING_DOWN)) {
+						break;
+					}
+				}
+
+				try {
+					// 执行所有任务 runAllTasks(),runShutdownHooks()
+					for (;;) {
+						if (confirmShutdown()) {
+							break;
+						}
+					}
+				} finally {
+					try {
+						// 钩子方法(可以子类实现)
+						cleanup();
+					} finally {
+						// 设置状态为终止
+						STATE_UPDATER.set(SingleThreadEventExecutor.this, ST_TERMINATED);
+						// 释放锁
+						threadLock.release();
+						terminationFuture.setSuccess(null);
+					}
+				}
+			}
+		}
+	});
+}
+</code></pre>
+<ul>
+<li>下面咱们就开始看一下这个重要的run方法,不多说,直接上源码</li>
+</ul>
+<pre><code class="language-java">// NioEventLoop.java
+protected void run() {
+	for (;;) {
+		try {
+			// 根据策略选择 具体判断为  如果队列中有任务 则返回selectNowSupplier.get()值 否则返回SelectStrategy.SELECT
+			// 本人理解:如果队列中没有任务了,这个时候需要把selector给阻塞住 调用selector.select
+			switch (selectStrategy.calculateStrategy(selectNowSupplier, hasTasks())) {
+				// 所以这个情况 基本算是不存在
+				case SelectStrategy.CONTINUE:
+					continue;
+				case SelectStrategy.SELECT:
+					// 此方法进行阻塞selector
+					select(wakenUp.getAndSet(false));
+					if (wakenUp.get()) {
+						// 再进行一次判断 如果wakenUp已经设置为true  则唤醒并返回通道
+						// 如果对selector的方法不太熟悉的 可以参考:http://ifeve.com/selectors/
+						selector.wakeup();
+					}
+				default:
+					// fallthrough
+			}
+
+			cancelledKeys = 0;
+			needsToSelectAgain = false;
+			// ioRatio这个变量表示IO任务和非IO任务执行时间的比例
+			// 默认是50 下面ioTime * (100 - ioRatio) / ioRatio 公式就会得出ioTime
+			// 这样表示IO任务处理时间和非IO任务处理时间要一致 也就是说IO和NON-IO必须执行时间相同
+			// 当然自己也可以设置,不过要注意ioRatio的value必须在0~100之间
+			// ioRatio的value越小表示非IO任务执行的时间越长,越大表示非IO任务执行的时间越短,如果时间到了就直接停止执行,谁让IO任务是优先级高呢(上头有人~~~)
+			// 如果设置成100  那么就会把所有的非IO任务执行完
+			final int ioRatio = this.ioRatio;
+			if (ioRatio == 100) {
+				try {
+					// 处理IO事件  也就是读写等
+					processSelectedKeys();
+				} finally {
+					// 确保Netty内部任务会执行(非IO任务)
+					runAllTasks();
+				}
+			} else {
+				final long ioStartTime = System.nanoTime();
+				try {
+					processSelectedKeys();
+				} finally {
+					final long ioTime = System.nanoTime() - ioStartTime;
+					runAllTasks(ioTime * (100 - ioRatio) / ioRatio);
+				}
+			}
+		} catch (Throwable t) {
+			handleLoopException(t);
+		}
+		// Always handle shutdown even if the loop processing threw an exception.
+		try {
+			if (isShuttingDown()) {
+				closeAll();
+				if (confirmShutdown()) {
+					return;
+				}
+			}
+		} catch (Throwable t) {
+			handleLoopException(t);
+		}
+	}
+}
+</code></pre>
+<ul>
+<li>上面的代码中有两个比较重要的点需要注意一下,一个是select方法,一个是ioRatio的作用 当然还有processSelectedKeys方法,先分析select方法</li>
+</ul>
+<pre><code class="language-java">// NioEventLoop.java
+private void select(boolean oldWakenUp) throws IOException {
+	Selector selector = this.selector;
+	try {
+		int selectCnt = 0;
+		long currentTimeNanos = System.nanoTime();
+		// delayNanos(currentTimeNanos) 定时任务/延时任务执行时间最近的一个
+		long selectDeadLineNanos = currentTimeNanos + delayNanos(currentTimeNanos);
+		for (;;) {
+			long timeoutMillis = (selectDeadLineNanos - currentTimeNanos + 500000L) / 1000000L;
+			if (timeoutMillis &lt;= 0) {
+				// 如果小于等于0了并且为第一次  则唤醒selector
+				if (selectCnt == 0) {
+					selector.selectNow();
+					selectCnt = 1;
+				}
+				break;
+			}
+
+			// 判断队列中是否有任务 并且设置wakenUp标识为true 则唤醒selector
+			if (hasTasks() &amp;&amp; wakenUp.compareAndSet(false, true)) {
+				selector.selectNow();
+				selectCnt = 1;
+				break;
+			}
+			// 阻塞selector 等待时间到达后返回的准备就绪的事件 如果没有事件  则返回0
+			int selectedKeys = selector.select(timeoutMillis);
+			selectCnt ++;
+
+			if (selectedKeys != 0 || oldWakenUp || wakenUp.get() || hasTasks() || hasScheduledTasks()) {
+				// 如果有事件 或者 oldWakenUp 旧标识 也是true || 当前标识也是true || 队列中有任务了 || 定时/延时任务队列中也有任务了
+				// 则立马返回  然后对事件进行处理
+				break;
+			}
+			if (Thread.interrupted()) {
+				// Thread was interrupted so reset selected keys and break so we not run into a busy loop.
+				// As this is most likely a bug in the handler of the user or it's client library we will
+				// also log it.
+				//
+				// See https://github.com/netty/netty/issues/2426
+				if (logger.isDebugEnabled()) {
+					logger.debug(&quot;Selector.select() returned prematurely because &quot; +
+							&quot;Thread.currentThread().interrupt() was called. Use &quot; +
+							&quot;NioEventLoop.shutdownGracefully() to shutdown the NioEventLoop.&quot;);
+				}
+				selectCnt = 1;
+				break;
+			}
+
+			long time = System.nanoTime();
+			if (time - TimeUnit.MILLISECONDS.toNanos(timeoutMillis) &gt;= currentTimeNanos) {
+				// timeoutMillis elapsed without anything selected.
+				selectCnt = 1;
+			} else if (SELECTOR_AUTO_REBUILD_THRESHOLD &gt; 0 &amp;&amp;
+					selectCnt &gt;= SELECTOR_AUTO_REBUILD_THRESHOLD) {
+				// 这里为了解决空转导致的CPU100% 当selectCnt 大于阈值时  进行selector重建
+				logger.warn(
+						&quot;Selector.select() returned prematurely {} times in a row; rebuilding Selector {}.&quot;,
+						selectCnt, selector);
+				// selector重建方法
+				rebuildSelector();
+				selector = this.selector;
+
+				// selectNow 立马返回准备好的通道
+				selector.selectNow();
+				selectCnt = 1;
+				break;
+			}
+
+			currentTimeNanos = time;
+		}
+
+		if (selectCnt &gt; MIN_PREMATURE_SELECTOR_RETURNS) {
+			if (logger.isDebugEnabled()) {
+				logger.debug(&quot;Selector.select() returned prematurely {} times in a row for Selector {}.&quot;,
+						selectCnt - 1, selector);
+			}
+		}
+	} catch (CancelledKeyException e) {
+		if (logger.isDebugEnabled()) {
+			logger.debug(CancelledKeyException.class.getSimpleName() + &quot; raised by a Selector {} - JDK bug?&quot;,
+					selector, e);
+		}
+		// Harmless exception - log anyway
+	}
+}
+</code></pre>
+<ul>
+<li>下面分析重要的IO事件执行方法processSelectedKeys</li>
+</ul>
+<pre><code class="language-java">private void processSelectedKeys() {
+	// 两个分支的主要处理逻辑基本差不多,这里就拿 processSelectedKeysOptimized 来分析了
+	if (selectedKeys != null) {
+		processSelectedKeysOptimized();
+	} else {
+		processSelectedKeysPlain(selector.selectedKeys());
+	}
+}
+private void processSelectedKeysOptimized() {
+	for (int i = 0; i &lt; selectedKeys.size; ++i) {
+		final SelectionKey k = selectedKeys.keys[i];
+		// 设置为null 为了让JVM GC
+		selectedKeys.keys[i] = null;
+		// 获取channel 这个设置是在第一章中AbstractNioChannel#doRegister方法中设置的
+		// selectionKey = javaChannel().register(eventLoop().unwrappedSelector(), 0, this); this就是channel
+		final Object a = k.attachment();
+
+		if (a instanceof AbstractNioChannel) {
+			// *
+			processSelectedKey(k, (AbstractNioChannel) a);
+		} else {
+			@SuppressWarnings(&quot;unchecked&quot;)
+			NioTask&lt;SelectableChannel&gt; task = (NioTask&lt;SelectableChannel&gt;) a;
+			processSelectedKey(k, task);
+		}
+		
+		// 上面设置的为false 就暂时不看了
+		if (needsToSelectAgain) {
+			selectedKeys.reset(i + 1);
+
+			selectAgain();
+			i = -1;
+		}
+	}
+}
+
+private void processSelectedKey(SelectionKey k, AbstractNioChannel ch) {
+	final AbstractNioChannel.NioUnsafe unsafe = ch.unsafe();
+	// 如果selectionKey无效
+	if (!k.isValid()) {
+		final EventLoop eventLoop;
+		try {
+			eventLoop = ch.eventLoop();
+		} catch (Throwable ignored) {
+			return;
+		}
+		// https://github.com/netty/netty/issues/5125
+		if (eventLoop != this || eventLoop == null) {
+			return;
+		}
+		unsafe.close(unsafe.voidPromise());
+		return;
+	}
+
+	try {
+		// 获取事件
+		int readyOps = k.readyOps();
+		if ((readyOps &amp; SelectionKey.OP_CONNECT) != 0) {
+			// 如果是连接事件
+			int ops = k.interestOps();
+			// 删除SelectionKey.OP_CONNECT	如果不删除会导致一个问题 具体请看:https://github.com/netty/netty/issues/924
+			ops &amp;= ~SelectionKey.OP_CONNECT;
+			k.interestOps(ops);
+			// 开始调用handler.channelActive()的处理链,注意上面提到的ServerBootstrapAcceptor类只是重写了channelRead方法
+			unsafe.finishConnect();
+		}
+		// 如果是写(write)事件 进行强制Flush  一般调用不到
+		if ((readyOps &amp; SelectionKey.OP_WRITE) != 0) {
+			ch.unsafe().forceFlush();
+		}
+		// 如果是读事件
+		if ((readyOps &amp; (SelectionKey.OP_READ | SelectionKey.OP_ACCEPT)) != 0 || readyOps == 0) {
+			// 进行handler的channelRead处理链调用注意首次unsafe是NioMessageUnsafe 因为Server端的channel是NioServerSocketChannel
+			// NioMessageUnsafe.read()的分析在上篇文章已经说过了,不记得的可以再去回顾一下
+			// 因为ServerBootstrapAcceptor重写了channelRead方法,所以肯定会调用到ServerBootstrapAcceptor#channelRead
+			unsafe.read();
+		}
+	} catch (CancelledKeyException ignored) {
+		unsafe.close(unsafe.voidPromise());
+	}
+}
+
+// ServerBootstrapAcceptor.java
+public void channelRead(ChannelHandlerContext ctx, Object msg) {
+	final Channel child = (Channel) msg;
+
+	child.pipeline().addLast(childHandler);
+
+	setChannelOptions(child, childOptions, logger);
+
+	for (Entry&lt;AttributeKey&lt;?&gt;, Object&gt; e: childAttrs) {
+		child.attr((AttributeKey&lt;Object&gt;) e.getKey()).set(e.getValue());
+	}
+	// ...上面的逻辑都是进行一些基础的设置就不多说了.
+	try {
+		// 看到了吧  childGroup注册child Channel
+		childGroup.register(child).addListener(new ChannelFutureListener() {
+			@Override
+			public void operationComplete(ChannelFuture future) throws Exception {
+				if (!future.isSuccess()) {
+					forceClose(child, future.cause());
+				}
+			}
+		});
+	} catch (Throwable t) {
+		forceClose(child, t);
+	}
+}
+</code></pre>
+<ul>
+<li>下面又流转到了AbstractChannel.AbstractUnsafe方法中了,此方法在上文中已经分析过了,请回顾。</li>
+<li>但是这次是childGroup,一定分清楚,这里的channel也是上面NioSocketChannel,注册channel到selector上的过程和之前分析的一样.最后流转到了processSelectedKey方法</li>
+<li>整体基本都一致。这也符合了Server创建的两个Group(类都是EventLoopGroup)</li>
+<li>唯一不一样的就是调用读事件是unsafe.read();  这里的unsafe是NioSocketChannel而不是Server中添加的NioServerSocketChannel了,这个一定要区分清楚.否则就理解不了netty的整体流程了</li>
+<li>下面咱们看一下NioSocketChannel的read方法,此方法在NioSocketChannel的父类子类NioByteUnsafe中</li>
+</ul>
+<pre><code class="language-java">// NioSocketChannel.NioByteUnsafe.java
+public final void read() {
+	final ChannelConfig config = config();
+	if (shouldBreakReadReady(config)) {
+		clearReadPending();
+		return;
+	}
+	final ChannelPipeline pipeline = pipeline();
+	// 构建netty特殊的buf,本章只讲流程,详细的类后续会陆陆续续讲解的
+	final ByteBufAllocator allocator = config.getAllocator();
+	final RecvByteBufAllocator.Handle allocHandle = recvBufAllocHandle();
+	allocHandle.reset(config);
+
+	ByteBuf byteBuf = null;
+	boolean close = false;
+	try {
+		do {
+			byteBuf = allocHandle.allocate(allocator);
+			// doReadBytes 调用channel把数据写入的buf中,此方法中最后还是调用了nio demo中的 channel.read方法
+			allocHandle.lastBytesRead(doReadBytes(byteBuf));
+			if (allocHandle.lastBytesRead() &lt;= 0) {
+				byteBuf.release();
+				byteBuf = null;
+				close = allocHandle.lastBytesRead() &lt; 0;
+				if (close) {
+					readPending = false;
+				}
+				break;
+			}
+
+			allocHandle.incMessagesRead(1);
+			readPending = false;
+			// 这个大家肯定熟悉了,调用handler的channelRead方法处理链
+			pipeline.fireChannelRead(byteBuf);
+			byteBuf = null;
+		} while (allocHandle.continueReading());
+
+		allocHandle.readComplete();
+		pipeline.fireChannelReadComplete();
+
+		if (close) {
+			closeOnRead(pipeline);
+		}
+	} catch (Throwable t) {
+		handleReadException(pipeline, byteBuf, t, close, allocHandle);
+	} finally {
+		// See https://github.com/netty/netty/issues/2254
+		if (!readPending &amp;&amp; !config.isAutoRead()) {
+			removeReadOp();
+		}
+	}
+}
+</code></pre>
+<ul>
+<li>netty的大致流程就写这么多了.如果有不对的地方,望指教,感谢。本文章后续会添加整体流程图</li>
+</ul>
+]]></content>
+    </entry>
     <entry>
         <title type="html"><![CDATA[netty源码分析流程(一)]]></title>
         <id>https://languidme.github.io//post/netty-yuan-ma-fen-xi-liu-cheng-yi</id>
@@ -278,6 +731,8 @@ public class ReflectiveChannelFactory&lt;T extends Channel&gt; implements Channe
     }
 	
 	// 此方法很重要,当Server连接好客户端后发生了读事件,就会调用此方法
+	// 这里new了一个NioSocketChannel类  workGroup就是对它进行的处理,具体的处理在ServerBootstrapAcceptor类中,注意ServerBootstrapAcceptor类为一个handler
+	// 这里大致记着就行，后续我会出一个流程图
     @Override
     protected int doReadMessages(List&lt;Object&gt; buf) throws Exception {
         SocketChannel ch = SocketUtils.accept(javaChannel());
